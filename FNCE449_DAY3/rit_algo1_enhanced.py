@@ -52,6 +52,8 @@ MIN_ORDER_SIZE = 50     # below this the fixed costs aren't worth the API call
 USE_LIMIT_ORDERS = True # marketable limits (safe) vs MARKET (always fills)
 CANCEL_GRACE = 1.0      # seconds a resting limit remainder gets before we cancel it
 CANCEL_POLL = 0.2       # how often we check the order while waiting out the grace period
+RESIDUAL_MAX_WAIT = 2.0 # seconds to keep retrying a naked-residual close through cooldowns
+FLATTEN_MAX_WAIT = 5.0  # seconds to keep retrying end-of-case flatten through cooldowns
 CASE_POLL_EVERY = 25    # scans between /v1/case refreshes
 LIMITS_POLL_EVERY = 40  # scans between /v1/limits refreshes
 GROSS_UTILISATION = 0.9 # only use this fraction of the gross limit
@@ -84,6 +86,14 @@ def log(msg):
         print(entry)
 
 
+def warn(msg):
+    """Like log(), but always prints immediately — for failures that matter
+    to see live (API errors, unclosed positions), not just in the final dump."""
+    entry = '[%7.2fs] %s' % (time.monotonic() - _T0, msg)
+    _log.append(entry)
+    print(entry)
+
+
 def session():
     """One keep-alive Session per thread so concurrent legs don't contend."""
     s = getattr(_local, 'session', None)
@@ -109,13 +119,14 @@ def api(method, path, params=None, ticker=None):
     try:
         resp = session().request(method, BASE + path, params=params, timeout=2.0)
     except requests.RequestException as exc:
-        log('NETWORK %s %s: %s' % (method, path, exc))
+        warn('NETWORK FAIL %s %s: %s' % (method, path, exc))
         return None
 
     if resp.status_code == 200:
         try:
             return _loads(resp.content)
         except ValueError:
+            warn('BAD JSON %s %s' % (method, path))
             return None
 
     if resp.status_code == 429:
@@ -132,10 +143,15 @@ def api(method, path, params=None, ticker=None):
             _cooldown[ticker] = until      # other securities stay tradeable
         else:
             _global_cooldown = until
+        warn('429 %s %s%s — cooling down %.2fs' %
+             (method, path, (' [%s]' % ticker) if ticker else '', wait))
         return None
 
     if resp.status_code == 401:
-        log('401 — API key mismatch with the RIT client. Fix API_KEY.')
+        warn('401 — API key mismatch with the RIT client. Fix API_KEY.')
+        return None
+
+    warn('HTTP %d %s %s' % (resp.status_code, method, path))
     return None
 
 
@@ -236,17 +252,36 @@ def await_fill_then_cancel(order_id, ticker, quantity_filled):
     return filled
 
 
-def flatten(ticker, position, max_size):
-    """Market out of a position, chunked to the venue's max trade size."""
-    remaining = abs(int(position))
-    action = 'SELL' if position > 0 else 'BUY'
-    while remaining > 0 and not throttled(ticker):
-        chunk = min(remaining, int(max_size) or remaining)
+def send_through_cooldown(ticker, action, quantity, max_wait, chunk_size=None):
+    """
+    Market order that rides out a 429 cooldown instead of giving up on the
+    first throttled attempt — a single-shot send silently leaves a residual
+    or an end-of-case position unclosed if the ticker happens to be cooling
+    down at that exact instant.
+    """
+    remaining = int(quantity)
+    deadline = time.monotonic() + max_wait
+    while remaining > 0 and time.monotonic() < deadline:
+        if throttled(ticker):
+            time.sleep(0.05)
+            continue
+        chunk = min(remaining, int(chunk_size) or remaining) if chunk_size else remaining
         filled, _ = send(ticker, action, chunk)
         if filled == 0:
             break
         remaining -= filled
-    log('FLATTEN %s %s %d' % (action, ticker, abs(int(position)) - remaining))
+    return int(quantity) - remaining
+
+
+def flatten(ticker, position, max_size):
+    """Market out of a position, chunked to the venue's max trade size."""
+    action = 'SELL' if position > 0 else 'BUY'
+    closed = send_through_cooldown(ticker, action, abs(int(position)),
+                                    FLATTEN_MAX_WAIT, max_size)
+    log('FLATTEN %s %s %d' % (action, ticker, closed))
+    if closed < abs(int(position)):
+        warn('WARNING %s still has %d unflattened after wind-down' %
+            (ticker, abs(int(position)) - closed))
 
 
 # ----------------------------------------------------------------------------
@@ -311,11 +346,15 @@ def execute(pool, buy_sec, sell_sec, quantity, buy_px, sell_px):
     # spread comes back.
     residual = bought - sold
     if residual > 0:
-        send(bt, 'SELL', residual)
-        log('RESIDUAL sold %d %s' % (residual, bt))
+        closed = send_through_cooldown(bt, 'SELL', residual, RESIDUAL_MAX_WAIT)
+        log('RESIDUAL sold %d %s' % (closed, bt))
+        if closed < residual:
+            warn('WARNING %s residual %d unclosed (cooldown)' % (bt, residual - closed))
     elif residual < 0:
-        send(st, 'BUY', -residual)
-        log('RESIDUAL bought %d %s' % (-residual, st))
+        closed = send_through_cooldown(st, 'BUY', -residual, RESIDUAL_MAX_WAIT)
+        log('RESIDUAL bought %d %s' % (closed, st))
+        if closed < -residual:
+            warn('WARNING %s residual %d unclosed (cooldown)' % (st, -residual - closed))
 
     matched = min(bought, sold)
     if matched:
@@ -346,6 +385,12 @@ def main():
     print('Trading pairs:', pairs)
     print('Fees:', {t: field(s, 'trading_fee', 'commission') for t, s in secs.items()})
 
+    # NLV is the exchange's own authoritative mark, so diffing it against the
+    # starting value gives realized P&L without us having to reconstruct fill
+    # prices for market-order residuals/flattens.
+    trader = api('GET', '/trader')
+    start_nlv = field(trader, 'nlv') if trader else None
+
     gross_limit, gross = 0, 0
     scans = 0
     volume = 0
@@ -366,6 +411,11 @@ def main():
                 row = limits[0] if isinstance(limits, list) else limits
                 gross = abs(field(row, 'gross'))
                 gross_limit = field(row, 'gross_limit')
+
+        if start_nlv is not None and scans % CASE_POLL_EVERY == 0:
+            trader = api('GET', '/trader')
+            if trader:
+                log('PNL %.2f' % (field(trader, 'nlv') - start_nlv))
 
         secs = scan()
         if not secs:
@@ -409,8 +459,25 @@ def main():
 
     pool.shutdown(wait=True)
 
+    # Belt-and-suspenders: confirm flatten() actually worked rather than
+    # trusting it silently, since a cooldown could still eat into its budget.
+    secs = scan()
+    leftover = {t: field(s, 'position') for t, s in secs.items() if field(s, 'position')}
+    if leftover:
+        warn('WARNING nonzero positions after wind-down: %s' % leftover)
+
+    pnl = None
+    if start_nlv is not None:
+        trader = api('GET', '/trader')
+        if trader:
+            pnl = field(trader, 'nlv') - start_nlv
+
     print('\n'.join(_log[-60:]))
     print('\nScans: %d   Arb shares traded: %d' % (scans, volume))
+    if pnl is not None:
+        print('Realized P&L: %.2f' % pnl)
+    if leftover:
+        print('WARNING: nonzero positions remain:', leftover)
 
 
 if __name__ == '__main__':
