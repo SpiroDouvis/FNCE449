@@ -8,7 +8,7 @@ Improvements over the starter algorithm:
   3. Fee-aware trigger: trades only when the spread clears BOTH commissions.
   4. Size to the top of book (and to the gross limit), never a blind 1000 lots.
   5. Both legs fire concurrently on separate keep-alive connections.
-  6. Marketable limit orders with automatic cancel of the unfilled remainder.
+  6. Marketable limit orders: any remainder resting after 1s unfilled is cancelled.
   7. Partial-fill reconciliation: any naked residual is flattened immediately.
   8. Generic pair discovery (CRZY_M/CRZY_A, TAME_M/TAME_A, ... ) from the ticker list.
   9. Per-security 429 cooldowns using the wait / Retry-After values.
@@ -50,6 +50,8 @@ MAX_ORDER_SIZE = 5000   # hard cap per leg regardless of what the book shows
 MIN_ORDER_SIZE = 50     # below this the fixed costs aren't worth the API call
 
 USE_LIMIT_ORDERS = True # marketable limits (safe) vs MARKET (always fills)
+CANCEL_GRACE = 1.0      # seconds a resting limit remainder gets before we cancel it
+CANCEL_POLL = 0.2       # how often we check the order while waiting out the grace period
 CASE_POLL_EVERY = 25    # scans between /v1/case refreshes
 LIMITS_POLL_EVERY = 40  # scans between /v1/limits refreshes
 GROSS_UTILISATION = 0.9 # only use this fraction of the gross limit
@@ -208,6 +210,32 @@ def cancel(order_id):
         api('DELETE', '/orders/%s' % order_id)
 
 
+def await_fill_then_cancel(order_id, ticker, quantity_filled):
+    """
+    Give a resting limit remainder up to CANCEL_GRACE seconds to fill before
+    cancelling it. Polls rather than sleeping the full grace period so a fill
+    that lands early doesn't cost the rest of the wait.
+    """
+    if not order_id:
+        return quantity_filled
+
+    deadline = time.monotonic() + CANCEL_GRACE
+    filled = quantity_filled
+    while True:
+        order = api('GET', '/orders/%s' % order_id, ticker=ticker)
+        if order:
+            filled = int(order.get('quantity_filled') or filled)
+            if order.get('status') != 'OPEN':
+                return filled
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(CANCEL_POLL, remaining))
+
+    cancel(order_id)
+    return filled
+
+
 def flatten(ticker, position, max_size):
     """Market out of a position, chunked to the venue's max trade size."""
     remaining = abs(int(position))
@@ -270,10 +298,14 @@ def execute(pool, buy_sec, sell_sec, quantity, buy_px, sell_px):
     bought, buy_id = fb.result()
     sold, sell_id = fs.result()
 
-    # Any unfilled remainder is now resting in the book where it can be picked
-    # off later. Kill it.
-    cancel(buy_id)
-    cancel(sell_id)
+    # Any unfilled remainder is now resting in the book. Give it CANCEL_GRACE
+    # seconds to fill before killing it — both legs wait concurrently.
+    fbw = pool.submit(await_fill_then_cancel, buy_id, bt, bought) if buy_id else None
+    fsw = pool.submit(await_fill_then_cancel, sell_id, st, sold) if sell_id else None
+    if fbw:
+        bought = fbw.result()
+    if fsw:
+        sold = fsw.result()
 
     # Partial fills leave us naked. Close the gap now rather than hoping the
     # spread comes back.
