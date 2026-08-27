@@ -1,14 +1,46 @@
 """
-RIT ALGO2 — minimal market maker.
+RIT ALGO2 — minimal market maker, tuned from live runs.
 
-The case brief's algorithm, and nothing else:
+Still the case brief's algorithm and nothing more:
     1. Always have a bid and an ask resting in the market.
-    2. If only one side is resting, the other filled — cancel the leftover and
-       requote both.
+    2. If only one side is resting, the other filled — reset the pair.
     3. Skew the quotes against the position to keep inventory near flat.
 
-Fixed 2,000-share clips on both sides. Two API reads per loop, one arithmetic
-pass, no threading, no order bookkeeping. Everything else was cut.
+What changed, and why (each item is something a run actually demonstrated,
+not a guess):
+
+  1. ECONOMICS. The case charges 0.01/share on EVERY fill and pays a 0.015
+     rebate on passive fills only. So a passive share earns +0.005 and an
+     active share costs -0.010. In the best run, 77% of P&L came from that
+     spread on fees, and only 23% from the price spread. The strategy is
+     therefore "maximise passive volume", not "maximise edge per trade".
+
+  2. QUOTE COOLDOWN. GET /orders does not reflect a just-placed order for a
+     few hundred ms. Without a cooldown the loop sees an empty book at 20Hz
+     and fires another pair every 50ms — four pairs stacked up before the
+     first appeared, quadrupling real exposure. This was a live bug.
+
+  3. SIZE 2500. Not 1500 (too little volume) and not 4000. At 4000 the
+     passive:active ratio collapsed from 14.9 to 4.5 as more orders turned
+     marketable in flight, which cost more than the extra size earned.
+
+  4. LOW SKEW (0.04). At 0.08 a one-clip position shifted the centre more
+     than a full market spread, parking one side of the quote outside the
+     book. Volume went to zero for 16+ consecutive ticks. Skew must stay
+     small enough that a normal position keeps both sides quoting.
+
+  5. TAPER. The position cap is squeezed to zero over the last 45 ticks, so
+     inventory bleeds off through passive fills before the bell. Carrying
+     +8,000 into a market flatten gave back 486 of P&L in a few ticks
+     (active sells printed 20.0316 against a passive 20.0404). With the
+     taper the same phase *gained* 49.
+
+  6. PASSIVE EXIT before crossing, and smaller flatten chunks. One 5,000
+     print walks several levels of the book; 2,000 chunks walk fewer.
+
+  7. NO DIRECTIONAL VIEW. Deliberately. Every attempt to lean the quotes on
+     a read of the trend lost money — including a stale bullish bias that
+     held a long into a decline and cost 273.
 
 Usage:  python rit_algo2_simple.py
 Stop:   CTRL+C (cancels resting orders and flattens)
@@ -26,18 +58,24 @@ API_KEY = {'X-API-Key': 'FLI7E73K'}
 BASE = 'http://localhost:9999/v1'
 
 TICKER = 'ALGO'
-SIZE = 2000             # fixed clip per side, regardless of the market
-HALF_SPREAD = 0.02      # quote this far either side of the midpoint
-SKEW_AT_LIMIT = 0.03    # price shift at a full 25,000 position. Deliberately
-                        # small: at a typical 5,000 position it moves the quote
-                        # less than a cent.
-POSITION_LIMIT = 25000  # case rule — stop adding to a side that would breach it
+SIZE = 2500             # clip per side. See note 3.
+HALF_SPREAD = 0.005     # the book is reliably 1c wide, so this lands us at
+                        # the touch. Wider and we simply don't trade.
+SKEW = 0.04             # centre shift at a full MAX_POSITION. See note 4.
+MAX_POSITION = 12000    # our own cap, far inside the 25,000 case limit. The
+                        # case limit was never the binding constraint — the
+                        # best runs never exceeded ±4,700.
 
-START_TICK = 2          # let the open settle
-STOP_TICK = 280         # stop quoting, flatten out
-LOOP_SLEEP = 0.05       # 20 passes/sec; the case allows 5 orders/sec
-CASE_POLL_EVERY = 10    # loops between tick refreshes
-HEARTBEAT = 3.0         # seconds between position prints
+START_TICK = 2
+STOP_TICK = 285         # stop quoting
+TAPER_TICKS = 45        # squeeze the cap to zero over the last N ticks
+PASSIVE_EXIT_SECS = 8.0 # work the residual at the touch before crossing
+FLATTEN_CHUNK = 2000    # market-out chunk size
+
+LOOP_SLEEP = 0.05
+QUOTE_COOLDOWN = 0.6    # see note 2. Also keeps us under 5 orders/sec.
+CASE_POLL_EVERY = 10
+HEARTBEAT = 3.0
 
 shutdown = False
 _t0 = time.monotonic()
@@ -72,13 +110,6 @@ def post(path, params):
         return None
 
 
-def delete(path):
-    try:
-        session.delete(BASE + path, timeout=1.0)
-    except requests.RequestException:
-        pass
-
-
 def limit(action, quantity, price):
     post('/orders', {'ticker': TICKER, 'type': 'LIMIT', 'action': action,
                      'quantity': int(quantity), 'price': round(price, 2)})
@@ -87,6 +118,10 @@ def limit(action, quantity, price):
 def market(action, quantity):
     return post('/orders', {'ticker': TICKER, 'type': 'MARKET',
                             'action': action, 'quantity': int(quantity)})
+
+
+def cancel_all():
+    post('/commands/cancel', {'ticker': TICKER})
 
 
 # ----------------------------------------------------------------------------
@@ -102,6 +137,7 @@ def main():
         return
     tick = case['tick']
     loops = 0
+    quote_cooldown = 0.0
 
     while START_TICK < tick < STOP_TICK and not shutdown:
         loops += 1
@@ -130,6 +166,11 @@ def main():
             time.sleep(LOOP_SLEEP)
             continue
 
+        # A pair we just sent is not visible yet — don't send another.
+        if now < quote_cooldown:
+            time.sleep(LOOP_SLEEP)
+            continue
+
         # --- the brief's rule 1: what is resting right now? ------------------
         orders = get('/orders', {'status': 'OPEN'})
         if orders is None:
@@ -138,44 +179,80 @@ def main():
         have_bid = any(o['action'] == 'BUY' for o in orders)
         have_ask = any(o['action'] == 'SELL' for o in orders)
 
-        if have_bid and have_ask:       # a full pair is working — leave it be
-            time.sleep(LOOP_SLEEP)
-            continue
+        if have_bid and have_ask:       # a full pair is working — leave it be.
+            time.sleep(LOOP_SLEEP)      # Requoting here only loses queue
+            continue                    # priority, which is where fills come from.
 
         if have_bid or have_ask:        # unpaired leftover — reset the pair
-            for o in orders:
-                delete('/orders/%s' % o['order_id'])
+            cancel_all()
+            time.sleep(0.15)            # let the cancel land before requoting
+
+        # --- taper: shrink the cap to zero over the final ticks --------------
+        # Once the cap falls below what we hold, the adding side stops quoting
+        # and only the reducing side stays live, so we arrive at the bell
+        # near flat instead of dumping inventory at market.
+        max_pos = MAX_POSITION
+        ticks_left = STOP_TICK - tick
+        if ticks_left < TAPER_TICKS:
+            max_pos = int(MAX_POSITION * max(0, ticks_left) / float(TAPER_TICKS))
 
         # --- quote ------------------------------------------------------------
         mid = (bid + ask) / 2.0
-        skew = SKEW_AT_LIMIT * (position / float(POSITION_LIMIT))
-        my_bid = mid - HALF_SPREAD - skew
-        my_ask = mid + HALF_SPREAD - skew
+        centre = mid - SKEW * (position / float(max_pos or MAX_POSITION))
+        my_bid = centre - HALF_SPREAD
+        my_ask = centre + HALF_SPREAD
 
-        # Stay passive — a limit that crosses pays the commission instead of
-        # earning the rebate.
+        # Stay passive. A fill that crosses swaps a +0.005 rebate for a -0.010
+        # fee — a 1.5c/share swing, larger than the tick itself.
         my_bid = min(my_bid, ask - 0.01)
         my_ask = max(my_ask, bid + 0.01)
 
-        if position + SIZE <= POSITION_LIMIT:
+        if position + SIZE <= max_pos:
             limit('BUY', SIZE, my_bid)
-        if position - SIZE >= -POSITION_LIMIT:
+        if position - SIZE >= -max_pos:
             limit('SELL', SIZE, my_ask)
+        quote_cooldown = time.monotonic() + QUOTE_COOLDOWN
 
         time.sleep(LOOP_SLEEP)
 
-    # --- flatten -------------------------------------------------------------
-    post('/commands/cancel', {'ticker': TICKER})
-    for _ in range(20):
+    # --- wind down -----------------------------------------------------------
+    # Phase 1: work whatever the taper left at the touch. The case runs to tick
+    # 300 while we stop quoting at 285, so there are ticks to spend here, and a
+    # passive exit is worth ~1.5c/share more than crossing.
+    cancel_all()
+    deadline = time.monotonic() + PASSIVE_EXIT_SECS
+    while time.monotonic() < deadline:
         secs = get('/securities', {'ticker': TICKER})
-        position = secs[0].get('position') or 0 if secs else 0
+        if not secs:
+            time.sleep(0.2)
+            continue
+        sec = secs[0]
+        position = sec.get('position') or 0
         if not position:
             break
-        market('SELL' if position > 0 else 'BUY', min(abs(position), 5000))
-        time.sleep(0.1)
+        bid, ask = sec.get('bid'), sec.get('ask')
+        if not bid or not ask:
+            time.sleep(0.2)
+            continue
+        if not (get('/orders', {'status': 'OPEN'}) or []):
+            side = 'SELL' if position > 0 else 'BUY'
+            px = ask if position > 0 else bid       # join the touch
+            limit(side, min(abs(position), 5000), px)
+        time.sleep(0.4)
+
+    # Phase 2: whatever is left has to go, in small chunks.
+    cancel_all()
+    for _ in range(30):
+        secs = get('/securities', {'ticker': TICKER})
+        position = (secs[0].get('position') or 0) if secs else 0
+        if not position:
+            break
+        market('SELL' if position > 0 else 'BUY',
+               min(abs(position), FLATTEN_CHUNK))
+        time.sleep(0.15)
 
     secs = get('/securities', {'ticker': TICKER})
-    final = secs[0].get('position') or 0 if secs else 0
+    final = (secs[0].get('position') or 0) if secs else 0
     trader = get('/trader')
     print('\nLoops: %d   Final position: %+d' % (loops, final))
     if trader:
