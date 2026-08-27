@@ -62,17 +62,37 @@ TICK_SIZE = 0.01
 DECIMALS = 2
 
 START_TICK = 2          # let the opening auction settle before quoting
-STOP_TICK = 285         # stop quoting for profit, start reducing inventory
-HARD_FLATTEN_TICK = 295 # market out of whatever is left, fine or no fine
+STOP_TICK = 265         # stop quoting for profit, start reducing inventory.
+                        # Early enough that the exit can be worked passively —
+                        # crossing to get flat costs 1.5c/share against us.
+HARD_FLATTEN_TICK = 293 # market out of whatever is left, fine or no fine
+
+# --- economics (from the case's Security Info, NOT the brief's prose) -------
+# The fee is PER_UNIT on EVERY share, active or passive. The rebate is paid
+# only on passive fills. So the per-share arithmetic is:
+#       passive fill : -FEE + REBATE = +0.005   (we get paid to provide)
+#       active  fill : -FEE          = -0.010   (we pay to consume)
+# The gap is 0.015/share — one and a half ticks. That number dominates every
+# other consideration in this case: a round trip that captures zero spread but
+# is passive on both legs still nets +0.01/share, while a passive buy unwound
+# by a market sell nets -0.005/share before any adverse price move. Crossing
+# the spread to manage a position we have plenty of room to hold is the single
+# most expensive mistake available to us.
+FEE = 0.010
+REBATE = 0.015
+PASSIVE_EDGE = REBATE - FEE     # +0.005 per passive share
+ACTIVE_COST = FEE               # -0.010 per active share
 
 # --- spread ---------------------------------------------------------------
-MIN_HALF_SPREAD = 0.01  # floor, in $/share, either side of fair value
+MIN_HALF_SPREAD = 0.02  # floor, in $/share, either side of fair value. At 0.01
+                        # we sat at the top of book and were adversely selected
+                        # — bought at 20.0632, sold at 20.0618.
 MAX_HALF_SPREAD = 0.10  # cap — past this we're not competitive, just decoration
 SPREAD_FRACTION = 0.60  # half-spread also scales with the market's own spread
 WIDEN_PER_INVENTORY = 1.0   # half-spread multiplier at full soft-limit inventory
 
 # --- inventory control ----------------------------------------------------
-QUOTE_SIZE = 1000       # base size per side. Smaller clips = smaller inventory
+QUOTE_SIZE = 2500       # base size per side. Smaller clips = smaller inventory
                         # jumps per fill = far less position volatility. We make
                         # it back on round-trip count, not on size.
 MAX_ORDER_SIZE = 5000   # case rule: 5,000 shares per order
@@ -81,26 +101,37 @@ BOOK_SIZE_FRACTION = 0.50   # never quote more than this fraction of the size
                         # resting at the opposite touch — sizing past what the
                         # market can absorb is how a clip becomes an position
 POSITION_LIMIT = 25000  # case rule; overridden by /limits when available
-SOFT_LIMIT_FRAC = 0.40  # beyond this fraction of the limit we quote one side only
-PANIC_LIMIT_FRAC = 0.75 # beyond this we market out back to the soft limit
+SOFT_LIMIT_FRAC = 0.50  # beyond this fraction of the limit we quote one side only
+PANIC_LIMIT_FRAC = 0.85 # beyond this we market out back to the soft limit. Last
+                        # run peaked at 4,750 against a 25,000 limit and still
+                        # market-flattened repeatedly — the risk was imaginary
+                        # and the fees were real.
 SKEW_STRENGTH = 1.5     # price shift, in half-spreads, at full soft-limit
                         # inventory. >1.0 means we'll quote the reducing side
                         # through fair value — deliberately paying to get flat.
 SIZE_SKEW_STRENGTH = 1.0    # at 1.0 the adding side hits zero exactly at the
                         # soft limit, rather than still adding a token clip
 
-# --- active flattening ----------------------------------------------------
-# The passive skew above only biases which side fills. These make the bot
-# actually chase flat, trading edge for a smaller and shorter-lived position.
-FLAT_BAND = 750         # |position| below this counts as flat; don't chase
-JOIN_TOUCH_URGENCY = 0.25   # urgency at which the reducing side joins the touch
-INSIDE_SPREAD_URGENCY = 0.60    # ...and at which it steps inside the spread
-STALE_INVENTORY_SECS = 20.0 # holding any position this long adds full urgency
-                        # on its own, even if it's small — time is risk
+# --- inventory chasing (PASSIVE ONLY) --------------------------------------
+# Urgency escalates where we *quote*, never whether we cross. Every rung on
+# this ladder still earns the rebate; none of them pays the 1.5c/share penalty
+# of taking liquidity. Market orders are reserved for the panic limit and the
+# end-of-case wind-down, and nothing else.
+FLAT_BAND = 2500        # |position| below this counts as flat; don't chase.
+                        # 2,500 is 10% of the limit — genuinely small.
+JOIN_TOUCH_URGENCY = 0.30   # urgency at which the reducing side joins the touch
+INSIDE_SPREAD_URGENCY = 0.65    # ...and at which it steps inside the spread
+STALE_INVENTORY_SECS = 90.0 # time alone saturates urgency this slowly. At 20s
+                        # a single fill triggered a market flatten every time.
 
 # --- order churn ----------------------------------------------------------
-REQUOTE_TOLERANCE = 0.01    # replace a resting quote only if it's this far off
-REQUOTE_SIZE_TOLERANCE = 0.40   # ...or if its size is this fraction wrong
+# Last run: 1,268 orders submitted, 44 trades — a 3.5% fill rate. Quotes were
+# cancelled and replaced on every 1c wiggle in the mid, so they never survived
+# in the queue long enough to be filled. Passive fills require patience.
+REQUOTE_TOLERANCE = 0.03    # replace a resting quote only if it's this far off
+REQUOTE_SIZE_TOLERANCE = 0.60   # ...or if its size is this fraction wrong
+MIN_REST_SECS = 3.0     # a quote gets at least this long in the queue before
+                        # we're allowed to replace it on price/size drift
 LOOP_SLEEP = 0.10       # pacing between scans
 CASE_POLL_EVERY = 10    # scans between /v1/case refreshes
 LIMITS_POLL_EVERY = 50  # scans between /v1/limits refreshes
@@ -122,6 +153,9 @@ _global_cooldown = 0.0
 _last_heartbeat = 0.0
 HEARTBEAT_EVERY = 3.0   # seconds between position prints, regardless of scan rate
 _nonflat_since = None   # monotonic time we last left the flat band
+_placed_at = {}         # order_id -> monotonic time we submitted it
+orders_placed = 0       # how many limit orders we submitted (churn measure)
+active_shares = 0       # shares filled via MARKET orders (the expensive kind)
 
 
 def signal_handler(signum, frame):
@@ -368,10 +402,10 @@ def compute_quotes(sec, position, soft_limit, hard_limit):
     bid_px = floor_tick(centre - half)
     ask_px = ceil_tick(centre + half)
 
-    # --- active flattening ------------------------------------------------
-    # Beyond the passive skew, escalate the *reducing* side toward the touch as
-    # urgency rises. We give up edge on that side on purpose: a fill that gets
-    # us flat is worth more than a wider spread we never trade.
+    # --- passive inventory chasing ----------------------------------------
+    # Escalate where the *reducing* side is quoted as urgency rises. Both rungs
+    # stay strictly passive, so a fill here still earns +0.005/share instead of
+    # costing 0.010 — we give up spread, never the rebate.
     urgency = inventory_urgency(position, soft_limit)
     if urgency >= JOIN_TOUCH_URGENCY:
         inside = urgency >= INSIDE_SPREAD_URGENCY
@@ -382,10 +416,10 @@ def compute_quotes(sec, position, soft_limit, hard_limit):
             target = (best_ask - TICK_SIZE) if inside else best_bid
             bid_px = max(bid_px, floor_tick(target))
 
-    # Stay passive. Crossing the touch turns a 0.5c rebate into a 1c commission,
-    # a 1.5c swing per share that no amount of spread capture pays back. This
-    # clamp runs after the escalation above, so "inside the spread" stays
-    # strictly inside — aggressive on queue position, never on fees.
+    # Stay passive. Crossing the touch swaps a +0.005 rebate for a -0.010 fee,
+    # a 1.5c/share swing that no amount of spread capture pays back. This clamp
+    # runs after the escalation above, so "inside the spread" stays strictly
+    # inside — aggressive on queue position, never on fees.
     bid_px = min(bid_px, floor_tick(best_ask - TICK_SIZE))
     ask_px = max(ask_px, ceil_tick(best_bid + TICK_SIZE))
     if ask_px - bid_px < TICK_SIZE:         # never quote through ourselves
@@ -433,12 +467,31 @@ def needs_replace(order, target_px, target_sz):
     Hysteresis. Replacing a resting order sends it to the back of the queue at
     its new price, so we only pay that cost when the quote is meaningfully
     stale — either mispriced or badly sized.
+
+    The MIN_REST_SECS floor is the important part: a passive fill only happens
+    if the order is still sitting there when the market comes to it. Replacing
+    on every 1c wiggle produced 1,268 orders and 44 trades last run, and zero
+    passive sells. An order that hasn't had its time in the queue is left alone
+    even if the target has drifted — unless the drift is so large that leaving
+    it would be dangerous (handled by the wide-miss check below).
     """
     if order is None:
         return target_sz > 0
     if target_sz <= 0:
         return True
-    if abs(field(order, 'price') - target_px) >= REQUOTE_TOLERANCE:
+
+    drift = abs(field(order, 'price') - target_px)
+
+    # A quote that has drifted more than a full half-spread is not just stale,
+    # it's exposed — replace it regardless of how long it has rested.
+    if drift >= max(REQUOTE_TOLERANCE * 2, MAX_HALF_SPREAD):
+        return True
+
+    resting_for = time.monotonic() - _placed_at.get(order.get('order_id'), 0.0)
+    if resting_for < MIN_REST_SECS:
+        return False
+
+    if drift >= REQUOTE_TOLERANCE:
         return True
     rest = remaining(order)
     return abs(rest - target_sz) > REQUOTE_SIZE_TOLERANCE * target_sz
@@ -448,19 +501,24 @@ def needs_replace(order, target_px, target_sz):
 # Order handling
 # ----------------------------------------------------------------------------
 def place(action, quantity, price):
+    global orders_placed
     if quantity < MIN_ORDER_SIZE or throttled(TICKER):
         return None
+    orders_placed += 1
     order = api('POST', '/orders', params={
         'ticker': TICKER, 'type': 'LIMIT', 'action': action,
         'quantity': int(quantity), 'price': round(price, DECIMALS),
     }, ticker=TICKER)
     if order:
+        if order.get('order_id') is not None:
+            _placed_at[order['order_id']] = time.monotonic()
         log('QUOTE %s %d @ %.2f' % (action, quantity, price))
     return order
 
 
 def cancel(order):
     if order:
+        _placed_at.pop(order.get('order_id'), None)
         api('DELETE', '/orders/%s' % order['order_id'], ticker=TICKER)
 
 
@@ -478,7 +536,11 @@ def flatten_to(target=0, deadline_s=10.0, respect_shutdown=True):
     `respect_shutdown=False` for the final wind-down: CTRL+C is supposed to get
     us flat, so the shutdown flag must not abort the very flatten it requested.
     A second CTRL+C still kills the process outright.
+
+    Every share this function trades costs 0.010 instead of earning 0.005, so
+    it is a last resort — the panic limit and the final wind-down, nothing else.
     """
+    global active_shares
     deadline = time.monotonic() + deadline_s
     while time.monotonic() < deadline:
         if respect_shutdown and shutdown:
@@ -504,6 +566,7 @@ def flatten_to(target=0, deadline_s=10.0, respect_shutdown=True):
         if resp is None:
             warn('FLATTEN rejected: %s %d at position %d' % (action, chunk, position))
         else:
+            active_shares += int(field(resp, 'quantity_filled', default=chunk))
             log('MARKET %s %d  (position was %d)' % (action, chunk, position))
         time.sleep(0.05)
     return False
@@ -587,17 +650,12 @@ def main():
             time.sleep(LOOP_SLEEP)
             continue
 
-        # --- backstop: passive flattening has had its chance ------------------
-        # Urgency saturated means we've been working the reducing side at or
-        # inside the touch for STALE_INVENTORY_SECS and still aren't flat — the
-        # market simply isn't coming to us. Pay the 1c commission and be done;
-        # carrying the position costs more in variance than the fee.
-        if urgency >= 1.0 and abs(position) > FLAT_BAND:
-            warn('STUCK position %+d — flattening at market' % position)
-            cancel_all()
-            flatten_to(0, deadline_s=FLATTEN_MAX_WAIT)
-            time.sleep(LOOP_SLEEP)
-            continue
+        # NOTE: there is deliberately no time-based market flatten here. The
+        # previous version market-sold whenever urgency saturated, which made
+        # every sell an active fill: 29,852 active sells, 0 passive sells,
+        # -$298 of commission where +$448 of rebate was available. Below the
+        # panic limit we have room to be patient, so we stay passive and let
+        # the quote escalation in compute_quotes do the work.
 
         bid_order, ask_order, extras = open_orders()
         for extra in extras:                # duplicate quotes from a raced replace
@@ -605,15 +663,27 @@ def main():
 
         # --- wind-down: stop making a market, start getting flat -------------
         if tick >= STOP_TICK:
-            if bid_order or ask_order:
-                cancel_all()
+            # Cancel only the side that would *grow* the position. The previous
+            # version called cancel_all() every pass, which killed the very
+            # flattening order it had placed 0.1s earlier — so it churned for
+            # the whole wind-down and never filled passively even once.
+            reducing = ask_order if position > 0 else bid_order
+            adding = bid_order if position > 0 else ask_order
+            if adding:
+                cancel(adding)
+
             if position:
-                # Work the touch passively first — the rebate beats the
-                # commission, and we still have ticks left to get filled.
+                # Work the touch passively — at +0.005 vs -0.010 a share, a
+                # passive exit is worth 1.5c/share more than crossing, and we
+                # still have ticks left for it to fill.
                 side = 'SELL' if position > 0 else 'BUY'
                 px = field(sec, 'bid') if position > 0 else field(sec, 'ask')
-                if px:
-                    place(side, min(abs(position), MAX_ORDER_SIZE), px)
+                size = min(abs(position), MAX_ORDER_SIZE)
+                if px and needs_replace(reducing, px, size):
+                    cancel(reducing)
+                    place(side, size, px)
+            elif reducing:
+                cancel(reducing)
             time.sleep(LOOP_SLEEP)
             continue
 
@@ -623,14 +693,16 @@ def main():
             continue
         bid_px, bid_sz, ask_px, ask_sz = quotes
 
-        # Brief rule 1: if only one side is resting, the other one filled — the
-        # survivor is now a stale unpaired order, so kill it and requote both.
-        # We fold that into the general replace test, which also catches the
-        # case where both sides are resting but the market has moved away.
+        # The brief says to cancel the survivor when only one side is resting.
+        # We deliberately don't do that blindly. When our bid fills we are long,
+        # and the surviving *ask* is precisely the order that will get us flat
+        # again — cancelling it throws away the queue priority of the one fill
+        # we most want. That is a large part of why last run had zero passive
+        # sells. The survivor is only replaced if it's genuinely stale, which
+        # needs_replace() already judges on price drift and resting time; the
+        # missing side is refilled below regardless.
         replace_bid = needs_replace(bid_order, bid_px, bid_sz)
         replace_ask = needs_replace(ask_order, ask_px, ask_sz)
-        if (bid_order is None) != (ask_order is None):
-            replace_bid = replace_ask = True
 
         if replace_bid:
             cancel(bid_order)
@@ -656,6 +728,14 @@ def main():
 
     print('\n'.join(_log[-60:]))
     print('\nScans: %d   Bought: %d   Sold: %d' % (scans, bought, sold))
+    # The ratio that decides this case. Every active share costs 0.010; every
+    # passive share earns 0.005. Last run this was 0 passive sells out of
+    # 29,852 — a $448 rebate left on the table plus $298 of commission paid.
+    print('Orders submitted: %d   Active (market) shares: %d'
+          % (orders_placed, active_shares))
+    if bought + sold:
+        print('Passive share of volume: %.1f%%'
+              % (100.0 * (1.0 - active_shares / float(bought + sold))))
     print('Final position: %+d' % leftover)
     if pnl is not None:
         if leftover:
