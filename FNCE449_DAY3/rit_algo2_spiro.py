@@ -72,14 +72,31 @@ SPREAD_FRACTION = 0.60  # half-spread also scales with the market's own spread
 WIDEN_PER_INVENTORY = 1.0   # half-spread multiplier at full soft-limit inventory
 
 # --- inventory control ----------------------------------------------------
-QUOTE_SIZE = 2500       # base size per side
+QUOTE_SIZE = 1000       # base size per side. Smaller clips = smaller inventory
+                        # jumps per fill = far less position volatility. We make
+                        # it back on round-trip count, not on size.
 MAX_ORDER_SIZE = 5000   # case rule: 5,000 shares per order
 MIN_ORDER_SIZE = 100    # below this the API call isn't worth the latency
+BOOK_SIZE_FRACTION = 0.50   # never quote more than this fraction of the size
+                        # resting at the opposite touch — sizing past what the
+                        # market can absorb is how a clip becomes an position
 POSITION_LIMIT = 25000  # case rule; overridden by /limits when available
-SOFT_LIMIT_FRAC = 0.60  # beyond this fraction of the limit we quote one side only
-PANIC_LIMIT_FRAC = 0.85 # beyond this we market out back to the soft limit
-SKEW_STRENGTH = 1.0     # price shift, in half-spreads, at full soft-limit inventory
-SIZE_SKEW_STRENGTH = 0.8    # size asymmetry at full soft-limit inventory
+SOFT_LIMIT_FRAC = 0.40  # beyond this fraction of the limit we quote one side only
+PANIC_LIMIT_FRAC = 0.75 # beyond this we market out back to the soft limit
+SKEW_STRENGTH = 1.5     # price shift, in half-spreads, at full soft-limit
+                        # inventory. >1.0 means we'll quote the reducing side
+                        # through fair value — deliberately paying to get flat.
+SIZE_SKEW_STRENGTH = 1.0    # at 1.0 the adding side hits zero exactly at the
+                        # soft limit, rather than still adding a token clip
+
+# --- active flattening ----------------------------------------------------
+# The passive skew above only biases which side fills. These make the bot
+# actually chase flat, trading edge for a smaller and shorter-lived position.
+FLAT_BAND = 750         # |position| below this counts as flat; don't chase
+JOIN_TOUCH_URGENCY = 0.25   # urgency at which the reducing side joins the touch
+INSIDE_SPREAD_URGENCY = 0.60    # ...and at which it steps inside the spread
+STALE_INVENTORY_SECS = 20.0 # holding any position this long adds full urgency
+                        # on its own, even if it's small — time is risk
 
 # --- order churn ----------------------------------------------------------
 REQUOTE_TOLERANCE = 0.01    # replace a resting quote only if it's this far off
@@ -87,7 +104,8 @@ REQUOTE_SIZE_TOLERANCE = 0.40   # ...or if its size is this fraction wrong
 LOOP_SLEEP = 0.10       # pacing between scans
 CASE_POLL_EVERY = 10    # scans between /v1/case refreshes
 LIMITS_POLL_EVERY = 50  # scans between /v1/limits refreshes
-FLATTEN_MAX_WAIT = 5.0  # seconds to keep retrying a market flatten through cooldowns
+FLATTEN_MAX_WAIT = 5.0  # seconds to keep retrying an intra-run flatten through cooldowns
+WINDDOWN_MAX_WAIT = 15.0    # seconds to keep retrying the final flatten
 
 VERBOSE = True          # True prints every quote/fill live
 
@@ -101,6 +119,9 @@ _local = threading.local()
 _log = []
 _cooldown = {}          # ticker -> monotonic timestamp until which it's throttled
 _global_cooldown = 0.0
+_last_heartbeat = 0.0
+HEARTBEAT_EVERY = 3.0   # seconds between position prints, regardless of scan rate
+_nonflat_since = None   # monotonic time we last left the flat band
 
 
 def signal_handler(signum, frame):
@@ -122,6 +143,13 @@ def warn(msg):
     entry = '[%7.2fs] %s' % (time.monotonic() - _T0, msg)
     _log.append(entry)
     print(entry)
+
+
+def quiet_log(msg):
+    """Record without ever printing live — for noise that's expected in normal
+    operation (e.g. cancelling an order that already filled) and only useful
+    in the post-run dump, regardless of VERBOSE."""
+    _log.append('[%7.2fs] %s' % (time.monotonic() - _T0, msg))
 
 
 def session():
@@ -175,8 +203,31 @@ def api(method, path, params=None, ticker=None):
         warn('401 — API key mismatch with the RIT client. Fix API_KEY.')
         return None
 
-    warn('HTTP %d %s %s' % (resp.status_code, method, path))
+    if resp.status_code == 404 and method == 'DELETE':
+        # Expected and constant: we tried to cancel an order that already
+        # filled or was already cancelled by an earlier pass. Not a failure.
+        quiet_log('HTTP 404 %s %s (order already gone)' % (method, path))
+        return None
+
+    # Routine — a rejected order near a limit, etc. Kept in the buffered log
+    # for the post-run dump, just not spammed to console.
+    quiet_log('HTTP %d %s %s' % (resp.status_code, method, path))
     return None
+
+
+def heartbeat(position, tick=None, note=''):
+    """Print position on a wall-clock cadence, independent of scan/loop speed —
+    this is the number that actually determines whether the P&L figure at the
+    end means anything, so it needs to be visible while the run is happening,
+    not just discovered after the fact."""
+    global _last_heartbeat
+    now = time.monotonic()
+    if now - _last_heartbeat < HEARTBEAT_EVERY:
+        return
+    _last_heartbeat = now
+    tick_part = ' tick %3d' % tick if tick is not None else ''
+    print('[%7.2fs]%s position %+d%s' % (now - _T0, tick_part, position,
+                                          ('  ' + note) if note else ''))
 
 
 def throttled(ticker):
@@ -257,6 +308,35 @@ def fair_value(sec):
     return last or (bid or ask or 0.0)
 
 
+def inventory_urgency(position, soft_limit):
+    """
+    How badly we want to be flat, in [0, 1].
+
+    Two independent drivers, whichever is worse:
+      - size : how much of the risk budget the position uses
+      - time : how long we've been carrying it at all
+
+    The time term matters because a market maker's edge is the spread, earned
+    per round trip. A position held for 60 seconds isn't earning spread — it's
+    just a directional bet we never intended to make, and its variance swamps
+    the pennies we're collecting. Inside FLAT_BAND we treat ourselves as flat
+    and stop the clock, so we don't churn over a 200-share residue.
+    """
+    global _nonflat_since
+    now = time.monotonic()
+
+    if abs(position) <= FLAT_BAND:
+        _nonflat_since = None
+        return 0.0
+
+    if _nonflat_since is None:
+        _nonflat_since = now
+
+    size_urgency = min(1.0, abs(position) / float(soft_limit)) if soft_limit else 0.0
+    time_urgency = min(1.0, (now - _nonflat_since) / STALE_INVENTORY_SECS)
+    return max(size_urgency, time_urgency)
+
+
 def compute_quotes(sec, position, soft_limit, hard_limit):
     """
     Returns (bid_price, bid_size, ask_price, ask_size). A size of 0 means
@@ -288,8 +368,24 @@ def compute_quotes(sec, position, soft_limit, hard_limit):
     bid_px = floor_tick(centre - half)
     ask_px = ceil_tick(centre + half)
 
+    # --- active flattening ------------------------------------------------
+    # Beyond the passive skew, escalate the *reducing* side toward the touch as
+    # urgency rises. We give up edge on that side on purpose: a fill that gets
+    # us flat is worth more than a wider spread we never trade.
+    urgency = inventory_urgency(position, soft_limit)
+    if urgency >= JOIN_TOUCH_URGENCY:
+        inside = urgency >= INSIDE_SPREAD_URGENCY
+        if position > 0:                    # long: work the ask down
+            target = (best_bid + TICK_SIZE) if inside else best_ask
+            ask_px = min(ask_px, ceil_tick(target))
+        elif position < 0:                  # short: work the bid up
+            target = (best_ask - TICK_SIZE) if inside else best_bid
+            bid_px = max(bid_px, floor_tick(target))
+
     # Stay passive. Crossing the touch turns a 0.5c rebate into a 1c commission,
-    # a 1.5c swing per share that no amount of spread capture pays back.
+    # a 1.5c swing per share that no amount of spread capture pays back. This
+    # clamp runs after the escalation above, so "inside the spread" stays
+    # strictly inside — aggressive on queue position, never on fees.
     bid_px = min(bid_px, floor_tick(best_ask - TICK_SIZE))
     ask_px = max(ask_px, ceil_tick(best_bid + TICK_SIZE))
     if ask_px - bid_px < TICK_SIZE:         # never quote through ourselves
@@ -298,10 +394,28 @@ def compute_quotes(sec, position, soft_limit, hard_limit):
     bid_sz = QUOTE_SIZE * (1.0 - SIZE_SKEW_STRENGTH * inv)
     ask_sz = QUOTE_SIZE * (1.0 + SIZE_SKEW_STRENGTH * inv)
 
+    # Don't quote more than the market can actually absorb at the touch. A clip
+    # larger than the resting size can only fill by the book trading through
+    # us, which is precisely when we least want the fill.
+    bid_book = field(sec, 'ask_size', 'ask_quantity')
+    ask_book = field(sec, 'bid_size', 'bid_quantity')
+    if bid_book:
+        bid_sz = min(bid_sz, max(MIN_ORDER_SIZE, BOOK_SIZE_FRACTION * bid_book))
+    if ask_book:
+        ask_sz = min(ask_sz, max(MIN_ORDER_SIZE, BOOK_SIZE_FRACTION * ask_book))
+
     # Never quote more than the room left before the position limit — a fill we
     # can't legally hold costs 10c/share.
     bid_sz = min(bid_sz, hard_limit - position, MAX_ORDER_SIZE)
     ask_sz = min(ask_sz, hard_limit + position, MAX_ORDER_SIZE)
+
+    # When we're chasing flat, let the reducing side carry the whole position
+    # rather than dribbling it out one base clip at a time.
+    if urgency >= JOIN_TOUCH_URGENCY:
+        if position > 0:
+            ask_sz = max(ask_sz, min(abs(position), MAX_ORDER_SIZE))
+        elif position < 0:
+            bid_sz = max(bid_sz, min(abs(position), MAX_ORDER_SIZE))
 
     # Past the soft limit, one-sided quoting: only the side that flattens us.
     if position >= soft_limit:
@@ -354,30 +468,45 @@ def cancel_all():
     api('POST', '/commands/cancel', params={'ticker': TICKER}, ticker=TICKER)
 
 
-def market_out(quantity, action):
-    """Take liquidity to reduce risk. Chunked to the per-order cap."""
-    remaining_qty = int(abs(quantity))
-    deadline = time.monotonic() + FLATTEN_MAX_WAIT
-    done = 0
-    while remaining_qty > 0 and time.monotonic() < deadline:
+def flatten_to(target=0, deadline_s=10.0, respect_shutdown=True):
+    """
+    Reduce the position toward `target`, judging progress by what /securities
+    actually reports rather than by what an order response claims. A rejected
+    or unacknowledged market order is retried until the deadline instead of
+    silently ending the flatten. Returns True if we reached the target.
+
+    `respect_shutdown=False` for the final wind-down: CTRL+C is supposed to get
+    us flat, so the shutdown flag must not abort the very flatten it requested.
+    A second CTRL+C still kills the process outright.
+    """
+    deadline = time.monotonic() + deadline_s
+    while time.monotonic() < deadline:
+        if respect_shutdown and shutdown:
+            return False
+        sec = snapshot()
+        if not sec:
+            time.sleep(0.05)
+            continue
+        position = field(sec, 'position')
+        heartbeat(position, note='flattening to %+d' % target)
+        excess = position - target
+        if abs(excess) < 1:
+            return True
         if throttled(TICKER):
             time.sleep(0.05)
             continue
-        chunk = min(remaining_qty, MAX_ORDER_SIZE)
-        order = api('POST', '/orders', params={
+        action = 'SELL' if excess > 0 else 'BUY'
+        chunk = min(abs(int(excess)), MAX_ORDER_SIZE)
+        resp = api('POST', '/orders', params={
             'ticker': TICKER, 'type': 'MARKET',
             'action': action, 'quantity': chunk,
         }, ticker=TICKER)
-        if not order:
-            break
-        filled = int(field(order, 'quantity_filled'))
-        if filled == 0:
-            break
-        done += filled
-        remaining_qty -= filled
-    if done:
-        log('MARKET %s %d' % (action, done))
-    return done
+        if resp is None:
+            warn('FLATTEN rejected: %s %d at position %d' % (action, chunk, position))
+        else:
+            log('MARKET %s %d  (position was %d)' % (action, chunk, position))
+        time.sleep(0.05)
+    return False
 
 
 # ----------------------------------------------------------------------------
@@ -436,6 +565,8 @@ def main():
             time.sleep(LOOP_SLEEP)
             continue
         position = field(sec, 'position')
+        urgency = inventory_urgency(position, soft_limit)
+        heartbeat(position, tick=tick, note='urgency %.2f' % urgency)
 
         # Track fills for the end-of-run report.
         delta = position - last_position
@@ -451,8 +582,21 @@ def main():
         if abs(position) > panic_limit:
             warn('PANIC position %d > %d — reducing at market' % (position, panic_limit))
             cancel_all()
-            excess = abs(position) - soft_limit
-            market_out(excess, 'SELL' if position > 0 else 'BUY')
+            flatten_to(soft_limit if position > 0 else -soft_limit,
+                       deadline_s=FLATTEN_MAX_WAIT)
+            time.sleep(LOOP_SLEEP)
+            continue
+
+        # --- backstop: passive flattening has had its chance ------------------
+        # Urgency saturated means we've been working the reducing side at or
+        # inside the touch for STALE_INVENTORY_SECS and still aren't flat — the
+        # market simply isn't coming to us. Pay the 1c commission and be done;
+        # carrying the position costs more in variance than the fee.
+        if urgency >= 1.0 and abs(position) > FLAT_BAND:
+            warn('STUCK position %+d — flattening at market' % position)
+            cancel_all()
+            flatten_to(0, deadline_s=FLATTEN_MAX_WAIT)
+            time.sleep(LOOP_SLEEP)
             continue
 
         bid_order, ask_order, extras = open_orders()
@@ -499,15 +643,10 @@ def main():
 
     # ---- wind down ---------------------------------------------------------
     cancel_all()
-    sec = snapshot()
-    position = field(sec, 'position') if sec else 0
-    if position:
-        market_out(abs(position), 'SELL' if position > 0 else 'BUY')
+    flat = flatten_to(0, deadline_s=WINDDOWN_MAX_WAIT, respect_shutdown=False)
 
     sec = snapshot()
     leftover = field(sec, 'position') if sec else 0
-    if leftover:
-        warn('WARNING %s still holds %d after wind-down' % (TICKER, leftover))
 
     pnl = None
     if start_nlv is not None:
@@ -517,8 +656,19 @@ def main():
 
     print('\n'.join(_log[-60:]))
     print('\nScans: %d   Bought: %d   Sold: %d' % (scans, bought, sold))
+    print('Final position: %+d' % leftover)
     if pnl is not None:
-        print('Realized P&L: %.2f' % pnl)
+        if leftover:
+            print('P&L (INCLUDES an unrealized mark on the %+d leftover — NOT purely '
+                  'realized): %.2f' % (leftover, pnl))
+        else:
+            print('Realized P&L: %.2f' % pnl)
+    if leftover or not flat:
+        print('*** WARNING: wind-down did not reach flat (position %+d). The P&L '
+              'above is not trustworthy as a realized number — the case likely '
+              'stopped accepting orders before the flatten finished. Consider '
+              'raising STOP_TICK\'s margin or shortening WINDDOWN_MAX_WAIT '
+              'expectations to fit inside the remaining ticks. ***' % leftover)
 
 
 if __name__ == '__main__':
