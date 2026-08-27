@@ -1,0 +1,11 @@
+{
+ "seq": 0,
+ "mode": "quote",
+ "half_spread": 0.005,
+ "size": 2500,
+ "skew": 0.04,
+ "bias": 0.0,
+ "max_position": 12000,
+ "orders": [],
+ "note": "run6: size 2500 skew 0.04 (passive ratio + stall fix), taper wind-down"
+}
