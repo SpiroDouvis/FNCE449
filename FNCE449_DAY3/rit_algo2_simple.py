@@ -1,51 +1,3 @@
-"""
-RIT ALGO2 — minimal market maker, tuned from live runs.
-
-Still the case brief's algorithm and nothing more:
-    1. Always have a bid and an ask resting in the market.
-    2. If only one side is resting, the other filled — reset the pair.
-    3. Skew the quotes against the position to keep inventory near flat.
-
-What changed, and why (each item is something a run actually demonstrated,
-not a guess):
-
-  1. ECONOMICS. The case charges 0.01/share on EVERY fill and pays a 0.015
-     rebate on passive fills only. So a passive share earns +0.005 and an
-     active share costs -0.010. In the best run, 77% of P&L came from that
-     spread on fees, and only 23% from the price spread. The strategy is
-     therefore "maximise passive volume", not "maximise edge per trade".
-
-  2. QUOTE COOLDOWN. GET /orders does not reflect a just-placed order for a
-     few hundred ms. Without a cooldown the loop sees an empty book at 20Hz
-     and fires another pair every 50ms — four pairs stacked up before the
-     first appeared, quadrupling real exposure. This was a live bug.
-
-  3. SIZE 2500. Not 1500 (too little volume) and not 4000. At 4000 the
-     passive:active ratio collapsed from 14.9 to 4.5 as more orders turned
-     marketable in flight, which cost more than the extra size earned.
-
-  4. LOW SKEW (0.04). At 0.08 a one-clip position shifted the centre more
-     than a full market spread, parking one side of the quote outside the
-     book. Volume went to zero for 16+ consecutive ticks. Skew must stay
-     small enough that a normal position keeps both sides quoting.
-
-  5. TAPER. The position cap is squeezed to zero over the last 45 ticks, so
-     inventory bleeds off through passive fills before the bell. Carrying
-     +8,000 into a market flatten gave back 486 of P&L in a few ticks
-     (active sells printed 20.0316 against a passive 20.0404). With the
-     taper the same phase *gained* 49.
-
-  6. PASSIVE EXIT before crossing, and smaller flatten chunks. One 5,000
-     print walks several levels of the book; 2,000 chunks walk fewer.
-
-  7. NO DIRECTIONAL VIEW. Deliberately. Every attempt to lean the quotes on
-     a read of the trend lost money — including a stale bullish bias that
-     held a long into a decline and cost 273.
-
-Usage:  python rit_algo2_simple.py
-Stop:   CTRL+C (cancels resting orders and flattens)
-"""
-
 import signal
 import time
 
@@ -62,7 +14,7 @@ SIZE = 2500             # clip per side. See note 3.
 HALF_SPREAD = 0.005     # the book is reliably 1c wide, so this lands us at
                         # the touch. Wider and we simply don't trade.
 SKEW = 0.04             # centre shift at a full MAX_POSITION. See note 4.
-MAX_POSITION = 12000    # our own cap, far inside the 25,000 case limit. The
+MAX_POSITION = 25000    # our own cap, far inside the 25,000 case limit. The
                         # case limit was never the binding constraint — the
                         # best runs never exceeded ±4,700.
 
